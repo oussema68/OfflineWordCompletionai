@@ -1,159 +1,161 @@
-import torch
-from typing import Dict, List, Tuple
-import nltk
-#nltk.download('punkt')
+import streamlit as st
+import sounddevice as sd
+import numpy as np
+import scipy.io.wavfile as wav
+from datetime import datetime
+from pocketsphinx import AudioFile, get_model_path
+import speech_recognition as sr
+import multiprocessing
+import os
 
-#nltk.download('wordnet')
-
-#nltk.download('vader_lexicon')
-#nltk.download('averaged_perceptron_tagger')
-
-import json
-from nltk.tokenize import word_tokenize
-from nltk.collocations import BigramCollocationFinder, BigramAssocMeasures
-from nltk.sentiment import SentimentIntensityAnalyzer
-from nltk.stem import WordNetLemmatizer
-from nltk.corpus import wordnet
-from textblob import TextBlob
-
-# Load the pre-trained model and tokenizer
-from transformers import GPT2Tokenizer, GPT2LMHeadModel
-
-model_name = 'gpt2'
-tokenizer = GPT2Tokenizer.from_pretrained(model_name, padding_side='left')
-model = GPT2LMHeadModel.from_pretrained(model_name)
-
-# Set device (CPU or GPU)
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-model.to(device)
-
-
-def preprocess(text):
-    # Tokenize the text
-    tokens = tokenizer.tokenize(text)
-
-    # Lemmatize the tokens
-    lemmatizer = nltk.stem.WordNetLemmatizer()
-    lemmatized_tokens = [lemmatizer.lemmatize(token, pos='v') for token in tokens]
-
-    # Perform POS tagging
-    pos_tags = nltk.pos_tag(tokens)
-
-    return lemmatized_tokens, pos_tags
-
-
-def find_collocations(text: str) -> List[Tuple[str, str]]:
-    # Tokenize the text
-    tokens = word_tokenize(text)
-
-    # Create BigramCollocationFinder
-    bigram_measures = BigramAssocMeasures()
-    finder = BigramCollocationFinder.from_words(tokens)
-
-    # Find the top 10 bigram collocations
-    collocations = finder.nbest(bigram_measures.pmi, 10)
-    return collocations
-
-
-def sentiment_analysis(text: str) -> Tuple[float, float]:
-    # Perform sentiment analysis
-    blob = TextBlob(text)
-    polarity, subjectivity = blob.sentiment
-    return polarity, subjectivity
-
-
-def run_nlp_pipeline(text: str) -> Dict[str, any]:
-    results = {}
-
-    # Preprocessing
-    tokens = word_tokenize(text)
-    lemmatizer = WordNetLemmatizer()
-    lemmatized_tokens = [lemmatizer.lemmatize(token, wordnet.VERB) for token in tokens]
-    pos_tags = nltk.pos_tag(tokens)
-    results['preprocessing'] = {
-        'lemmatized_tokens': lemmatized_tokens,
-        'pos_tags': pos_tags
-    }
-
-    # Collocations
-    tokens = word_tokenize(text)
-    bigram_measures = BigramAssocMeasures()
-    finder = BigramCollocationFinder.from_words(tokens)
-    collocations = finder.nbest(bigram_measures.pmi, 10)
-    results['collocations'] = {'top_10_collocations': collocations}
-
-    # Sentiment analysis
-    blob = TextBlob(text)
-    polarity, subjectivity = blob.sentiment
-    results['sentiment_analysis'] = {'polarity': polarity, 'subjectivity': subjectivity}
-
-    return results
-
-
-# The rest of the code remains unchanged
-
-
-
-
-
-
-
-def generate_summary(text, summary_length=3):
+# Importing the offline and online noise filtering functions
+def offline_noise_filter(data, window_size):
     """
-    Summarizes the input text by returning the top `summary_length` sentences based on the sum of the
-    sentiment polarities of each sentence.
+    Applies offline noise filtering by convolving the audio data with a moving average filter.
+    This smoothens the data over a fixed window size.
     """
-    sentences = nltk.sent_tokenize(text)
-    sid = SentimentIntensityAnalyzer()
-    sent_polarities = []
-    for sent in sentences:
-        sentiment_score = sid.polarity_scores(sent)
-        polarity = sentiment_score['compound']
-        sent_polarities.append(polarity)
-    summary_indices = sorted(range(len(sentences)), key=lambda i: sent_polarities[i], reverse=True)[:summary_length]
-    summary = [sentences[i] for i in summary_indices]
-    return " ".join(summary)
+    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
 
-def generate_dialogue(text, character_name="Alice"):
+def online_noise_filter(new_data, prev_filtered_data, window_size):
     """
-    Generates a dialogue between the input character name and another speaker based on the top
-    collocations in the input text.
+    Applies online noise filtering using a moving average filter.
+    This updates the filtered data in real-time as new audio data is captured.
     """
-    preprocessed = preprocess(text)
-    tokens = word_tokenize(text)
-    bigram_measures = BigramAssocMeasures()
-    finder = BigramCollocationFinder.from_words(tokens)
-    collocations = finder.nbest(bigram_measures.raw_freq, 10)
-    dialogue = []
-    for colloc in collocations:
-        dialogue.append(f"{character_name}: What do you think about {colloc[0]}?")
-        dialogue.append(f"Speaker: I think {colloc[1]}")
-    return "\n".join(dialogue)
+    updated_data = np.append(prev_filtered_data, new_data)
+    updated_data = updated_data[-window_size:]
+    return np.convolve(updated_data, np.ones(window_size)/window_size, mode='valid')
 
+# Create a session state to persistently store variables
+session_state = st.session_state
 
+def create_directory(directory):
+    """
+    Creates a directory if it does not exist.
+    """
+    try:
+        if not os.path.exists(directory):
+            os.makedirs(directory)
+            print(f"Directory '{directory}' created successfully.")
+    except Exception as e:
+        print(f"Error creating directory '{directory}': {e}")
 
+def create_file(filename):
+    """
+    Creates a new file. Raises an error if the file already exists.
+    """
+    try:
+        with open(filename, 'x'):  # 'x' mode creates a new file; raises an error if the file already exists
+            print(f"File '{filename}' created successfully.")
+    except Exception as e:
+        print(f"Error creating file '{filename}': {e}")
 
+def capture_audio(duration):
+    """
+    Captures audio for the specified duration using sounddevice and returns the recorded data.
+    """
+    st.text("Recording audio... Click the button below to stop recording.")
+    audio_data = sd.rec(int(duration * 44100), samplerate=44100, channels=2, dtype=np.int16)
+    sd.wait()  # Wait until the recording is done
+    st.text("Audio recording complete.")
+    return audio_data
 
-def generate_response(text):
-    # Preprocess input text
-    preprocessed_text = preprocess(text)
+# Queue for handling multiprocessing tasks like transcription
+result_queue = multiprocessing.Queue()
 
-    # Tokenize input text
-    input_tokens = tokenizer.encode(preprocessed_text[0], add_special_tokens=True, return_tensors='pt').to(device)
+def play_audio(audio_data, audio_count):
+    """
+    Plays the recorded audio after applying offline and online noise filtering. Saves the audio to a file
+    and transcribes it.
+    """
+    st.text("Playing recorded audio...")
 
-    # Generate output
-    output = model.generate(input_tokens, max_length=100, pad_token_id=tokenizer.eos_token_id, do_sample=True)
-    output_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    # Apply offline noise filtering to the audio data
+    window_size_offline = 3
+    audio_data_filtered = offline_noise_filter(audio_data[:, 0], window_size_offline)
+    audio_data_filtered = np.column_stack((audio_data_filtered, audio_data_filtered))  # Duplicate for stereo
 
-    return output_text
+    # Apply online noise filtering to the audio data
+    window_size_online = 3
+    prev_filtered_data_online = audio_data_filtered[-window_size_online:, 0]
+    for i in range(len(audio_data_filtered)):
+        audio_data_filtered[i] = online_noise_filter(audio_data_filtered[i, 0], prev_filtered_data_online, window_size_online)
+        prev_filtered_data_online = audio_data_filtered[i, 0]
 
-def chatbot_response(input_text):
-    return generate_response(input_text)
+    # Create 'audios' directory if it doesn't exist
+    create_directory('audios')
 
-# Example usage
-user_input = input("User: ")
-while user_input != "bye":
-    response = chatbot_response(user_input)
-    print("ChatBot:", response)
-    user_input = input("User: ")
+    # Generate a unique filename with a timestamp
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    
+    # Save the filtered audio data to a WAV file
+    wav_filename = f'audios/{audio_count}.wav'
+    create_file(wav_filename)
+    wav.write(wav_filename, 44100, audio_data_filtered)
 
+    # Display the saved audio file in the app for playback
+    st.audio(wav_filename, format='audio/wav')
+
+    # Transcribe the audio using speech recognition
+    result = transcribe_audio(wav_filename)
+
+    # Display the transcription result
+    if result:
+        st.text(f"Transcription: {result}")
+    else:
+        st.text("Could not understand audio.")
+
+def transcribe_audio(audio_path, num_runs=3):
+    """
+    Transcribes the given audio file using the PocketSphinx speech recognition engine. 
+    The transcription is attempted multiple times to get a consistent result.
+    """
+    recognizer = sr.Recognizer()
+
+    results = []  # Store transcription results from multiple runs
+
+    for _ in range(num_runs):
+        try:
+            # Load the audio file for transcription
+            with sr.AudioFile(audio_path) as source:
+                audio_data = recognizer.record(source)
+
+                # Use pocketsphinx for offline transcription
+                result = recognizer.recognize_sphinx(audio_data)
+                results.append(result)
+
+        except sr.UnknownValueError:
+            print("Could not understand audio.")
+        except sr.RequestError as e:
+            print(f"Error in offline transcription: {e}")
+
+    # Return the most common transcription result
+    valid_results = [result for result in results if result is not None]
+    if valid_results:
+        most_common_result = max(set(valid_results), key=valid_results.count)
+        return most_common_result
+    else:
+        return None
+
+def main():
+    """
+    Main function for the Streamlit app. Allows users to record audio, play it back, and display transcriptions.
+    """
+    st.title("Audio Recorder and Player")
+
+    # User selects the duration of the audio recording
+    duration = st.slider("Select recording duration (seconds):", 1, 10, 5)
+
+    # Start recording when the user clicks the button
+    if st.button("Record Audio"):
+        if 'audio_count' not in session_state:
+            session_state.audio_count = 1
+        else:
+            session_state.audio_count += 1
+
+        # Capture audio and then play it back
+        audio_data = capture_audio(duration)
+        play_audio(audio_data, session_state.audio_count)
+
+# Entry point of the script
+if __name__ == "__main__":
+    main()

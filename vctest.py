@@ -1,143 +1,178 @@
-import streamlit as st
-import sounddevice as sd
-import numpy as np
-import scipy.io.wavfile as wav
-from datetime import datetime
-from pocketsphinx import AudioFile, get_model_path
-import speech_recognition as sr
-import multiprocessing
-import os
+import torch  # Importing PyTorch for deep learning and tensor computations
+from typing import Dict, List, Tuple  # Importing type hints for better code clarity
+import nltk  # Natural Language Toolkit for NLP tasks
+
+# Uncomment the lines below if you need to download these NLTK resources
+# nltk.download('punkt')  # Tokenizer
+# nltk.download('wordnet')  # WordNet, used for lemmatization
+# nltk.download('vader_lexicon')  # Lexicon for sentiment analysis
+# nltk.download('averaged_perceptron_tagger')  # POS tagger
+
+import json  # Importing for JSON handling (though not used directly in this code)
+from nltk.tokenize import word_tokenize  # For tokenizing text into words
+from nltk.collocations import BigramCollocationFinder, BigramAssocMeasures  # For finding bigram collocations
+from nltk.sentiment import SentimentIntensityAnalyzer  # For sentiment analysis
+from nltk.stem import WordNetLemmatizer  # For lemmatizing words (reducing them to base forms)
+from nltk.corpus import wordnet  # WordNet corpus for lemmatization
+from textblob import TextBlob  # For simpler sentiment analysis
+
+# Import pre-trained GPT-2 model and tokenizer from Hugging Face's transformers library
+from transformers import GPT2Tokenizer, GPT2LMHeadModel
+
+# Load GPT-2 model and tokenizer
+model_name = 'gpt2'
+tokenizer = GPT2Tokenizer.from_pretrained(model_name, padding_side='left')  # GPT-2 tokenizer with left padding
+model = GPT2LMHeadModel.from_pretrained(model_name)  # GPT-2 language model
+
+# Check if a GPU is available and set the device to either 'cuda' (GPU) or 'cpu'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+model.to(device)  # Send the GPT-2 model to the selected device (GPU/CPU)
 
 
+def preprocess(text):
+    """
+    Preprocesses the input text by tokenizing, lemmatizing, and performing POS tagging.
+    """
+    # Tokenize the text using GPT-2's tokenizer
+    tokens = tokenizer.tokenize(text)
 
-# Importing the offline and online noise filtering functions
-def offline_noise_filter(data, window_size):
-    return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
+    # Lemmatize the tokens (convert words to their base form)
+    lemmatizer = nltk.stem.WordNetLemmatizer()
+    lemmatized_tokens = [lemmatizer.lemmatize(token, pos='v') for token in tokens]
 
-def online_noise_filter(new_data, prev_filtered_data, window_size):
-    updated_data = np.append(prev_filtered_data, new_data)
-    updated_data = updated_data[-window_size:]
-    return np.convolve(updated_data, np.ones(window_size)/window_size, mode='valid')
+    # Perform POS (Part-of-Speech) tagging on tokens
+    pos_tags = nltk.pos_tag(tokens)
 
-# Create a session state to persistently store variables
-session_state = st.session_state
+    return lemmatized_tokens, pos_tags
 
-def create_directory(directory):
-    try:
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-            print(f"Directory '{directory}' created successfully.")
-    except Exception as e:
-        print(f"Error creating directory '{directory}': {e}")
 
-def create_file(filename):
-    try:
-        with open(filename, 'x'):  # 'x' mode creates a new file; raises an error if the file already exists
-            print(f"File '{filename}' created successfully.")
-    except Exception as e:
-        print(f"Error creating file '{filename}': {e}")
+def find_collocations(text: str) -> List[Tuple[str, str]]:
+    """
+    Finds the top 10 bigram collocations (word pairs that frequently occur together) in the input text.
+    """
+    # Tokenize the text into words
+    tokens = word_tokenize(text)
 
-def capture_audio(duration):
-    st.text("Recording audio... Click the button below to stop recording.")
-    audio_data = sd.rec(int(duration * 44100), samplerate=44100, channels=2, dtype=np.int16)
-    sd.wait()
-    st.text("Audio recording complete.")
-    return audio_data
+    # Create a BigramCollocationFinder to find word pairs (bigrams)
+    bigram_measures = BigramAssocMeasures()
+    finder = BigramCollocationFinder.from_words(tokens)
 
-result_queue = multiprocessing.Queue()
+    # Find and return the top 10 bigram collocations based on Pointwise Mutual Information (PMI)
+    collocations = finder.nbest(bigram_measures.pmi, 10)
+    return collocations
 
-def play_audio(audio_data, audio_count):
-    st.text("Playing recorded audio...")
 
-    # Apply offline noise filtering to the audio data
-    window_size_offline = 3
-    audio_data_filtered = offline_noise_filter(audio_data[:, 0], window_size_offline)
-    audio_data_filtered = np.column_stack((audio_data_filtered, audio_data_filtered))  # Duplicate for stereo
+def sentiment_analysis(text: str) -> Tuple[float, float]:
+    """
+    Performs sentiment analysis on the input text, returning its polarity and subjectivity.
+    """
+    # Use TextBlob to analyze the sentiment of the text
+    blob = TextBlob(text)
+    polarity, subjectivity = blob.sentiment  # Polarity (-1 to 1) and subjectivity (0 to 1)
+    return polarity, subjectivity
 
-    # Apply online noise filtering to the audio data
-    window_size_online = 3
-    prev_filtered_data_online = audio_data_filtered[-window_size_online:, 0]
-    for i in range(len(audio_data_filtered)):
-        audio_data_filtered[i] = online_noise_filter(audio_data_filtered[i, 0], prev_filtered_data_online, window_size_online)
-        prev_filtered_data_online = audio_data_filtered[i, 0]
 
-    # Create 'audios' directory if it doesn't exist
-    create_directory('audios')
+def run_nlp_pipeline(text: str) -> Dict[str, any]:
+    """
+    Runs the NLP pipeline: Preprocessing, collocations, and sentiment analysis on the input text.
+    """
+    results = {}
 
-    # Generate a unique filename with a timestamp
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    # Preprocessing: Tokenization, Lemmatization, and POS tagging
+    tokens = word_tokenize(text)
+    lemmatizer = WordNetLemmatizer()
+    lemmatized_tokens = [lemmatizer.lemmatize(token, wordnet.VERB) for token in tokens]
+    pos_tags = nltk.pos_tag(tokens)
+    results['preprocessing'] = {
+        'lemmatized_tokens': lemmatized_tokens,
+        'pos_tags': pos_tags
+    }
+
+    # Collocations: Finding the top 10 bigram collocations in the text
+    tokens = word_tokenize(text)
+    bigram_measures = BigramAssocMeasures()
+    finder = BigramCollocationFinder.from_words(tokens)
+    collocations = finder.nbest(bigram_measures.pmi, 10)
+    results['collocations'] = {'top_10_collocations': collocations}
+
+    # Sentiment analysis: Analyze the polarity and subjectivity of the text
+    blob = TextBlob(text)
+    polarity, subjectivity = blob.sentiment
+    results['sentiment_analysis'] = {'polarity': polarity, 'subjectivity': subjectivity}
+
+    return results
+
+
+def generate_summary(text, summary_length=3):
+    """
+    Summarizes the input text by selecting the top sentences based on sentiment scores.
+    """
+    # Tokenize the text into sentences
+    sentences = nltk.sent_tokenize(text)
+
+    # Initialize a SentimentIntensityAnalyzer (VADER)
+    sid = SentimentIntensityAnalyzer()
     
-    # WAV file
-    wav_filename = f'audios/{audio_count}.wav'
-    create_file(wav_filename)
-    wav.write(wav_filename, 44100, audio_data_filtered)
+    # Compute the sentiment score (polarity) for each sentence
+    sent_polarities = []
+    for sent in sentences:
+        sentiment_score = sid.polarity_scores(sent)
+        polarity = sentiment_score['compound']  # Compound sentiment score
+        sent_polarities.append(polarity)
+    
+    # Select top sentences with the highest sentiment polarities
+    summary_indices = sorted(range(len(sentences)), key=lambda i: sent_polarities[i], reverse=True)[:summary_length]
+    summary = [sentences[i] for i in summary_indices]
+    return " ".join(summary)
 
-    # Display the WAV audio
-    st.audio(wav_filename, format='audio/wav')
 
-    # Transcribe the audio in a separate process
-    #process = multiprocessing.Process(target=transcribe_worker, args=(wav_filename, result_queue))
-   # process.start()
-    #st.text("ebda nayek")
+def generate_dialogue(text, character_name="Alice"):
+    """
+    Generates a dialogue between the specified character and another speaker based on collocations in the text.
+    """
+    preprocessed = preprocess(text)  # Preprocess the text
+    tokens = word_tokenize(text)  # Tokenize the text into words
+    bigram_measures = BigramAssocMeasures()
+    finder = BigramCollocationFinder.from_words(tokens)
+    collocations = finder.nbest(bigram_measures.raw_freq, 10)  # Find collocations
+    
+    # Create a dialogue based on the collocations
+    dialogue = []
+    for colloc in collocations:
+        dialogue.append(f"{character_name}: What do you think about {colloc[0]}?")
+        dialogue.append(f"Speaker: I think {colloc[1]}")
+    
+    return "\n".join(dialogue)
 
-    # Wait for the transcription process to finish, with a timeout
-  #  process.join(timeout=30)  # You can adjust the timeout as needed
-   # st.text("join zok omok")
 
-    # If the process is still alive, terminate it
-    #if process.is_alive():
-     #   process.terminate()
-   # st.text("not alive nor dead")
+def generate_response(text):
+    """
+    Generates a text-based response using the GPT-2 model.
+    """
+    preprocessed_text = preprocess(text)  # Preprocess the input text
 
-    # Retrieve the transcription result
-    result = transcribe_audio(wav_filename)
+    # Encode the input text as tokens for GPT-2 model
+    input_tokens = tokenizer.encode(preprocessed_text[0], add_special_tokens=True, return_tensors='pt').to(device)
 
-    if result:
-        st.text(f"Transcription: {result}")
-    else:
-        st.text("Could not understand audio.")
+    # Generate the output using GPT-2 with a maximum length of 100 tokens
+    output = model.generate(input_tokens, max_length=100, pad_token_id=tokenizer.eos_token_id, do_sample=True)
+    
+    # Decode the output tokens into human-readable text
+    output_text = tokenizer.decode(output[0], skip_special_tokens=True)
 
-def transcribe_audio(audio_path, num_runs=3):
-    recognizer = sr.Recognizer()
+    return output_text
 
-    results = []
 
-    for _ in range(num_runs):
-        try:
-            # Load audio file
-            with sr.AudioFile(audio_path) as source:
-                audio_data = recognizer.record(source)
+def chatbot_response(input_text):
+    """
+    Generates a chatbot response using the GPT-2 model.
+    """
+    return generate_response(input_text)
 
-                # Use pocketsphinx for offline transcription
-                result = recognizer.recognize_sphinx(audio_data)
-                results.append(result)
 
-        except sr.UnknownValueError:
-            print("Could not understand audio.")
-        except sr.RequestError as e:
-            print(f"Error in offline transcription: {e}")
-
-    # Filter out None results and return the most common transcription
-    valid_results = [result for result in results if result is not None]
-    if valid_results:
-        most_common_result = max(set(valid_results), key=valid_results.count)
-        return most_common_result
-    else:
-        return None
-
-def main():
-    st.title("Audio Recorder and Player")
-
-    duration = st.slider("Select recording duration (seconds):", 1, 10, 5)
-
-    if st.button("Record Audio"):
-        if 'audio_count' not in session_state:
-            session_state.audio_count = 1
-        else:
-            session_state.audio_count += 1
-
-        audio_data = capture_audio(duration)
-        play_audio(audio_data, session_state.audio_count)
-
-if __name__ == "__main__":
-    main()
+# Example usage of the chatbot
+user_input = input("User: ")
+while user_input != "bye":
+    response = chatbot_response(user_input)  # Generate a response
+    print("ChatBot:", response)  # Print the chatbot response
+    user_input = input("User: ")  # Get the next user input
