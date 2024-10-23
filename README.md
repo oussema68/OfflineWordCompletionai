@@ -86,7 +86,7 @@ python vctest.py
 ### **Contributing Guidelines**
 Add more detailed instructions for how contributors can add to the project, format code, or raise issues.
 
-```markdown
+
 ## Contributing
 
 1. Fork the repository.
